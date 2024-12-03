@@ -14,11 +14,11 @@ class ConvertibleBondPricer:
         """
         初始化參數
         S: 標的股票現價
-        K: 轉換價格
+        K: 債券面額
         T: 剩餘期限(年)
         r: 無風險利率
         sigma: 波動率
-        conversion_ratio: 轉換比率
+        conversion_ratio: 轉換比率(每張轉債可轉換股數)
         credit_spread: 信用利差
         trigger_price: 觸發價格
         """
@@ -61,6 +61,7 @@ class ConvertibleBondPricer:
 
         # 計算組件價值
         bond_value = self.K * np.exp(-(self.r + self.credit_spread)*self.T) * (1 - prob_mandatory)
+        #bond_value = 100 * np.exp(-(self.r + self.credit_spread)*self.T) * (1 - prob_mandatory)(暫時註解)
         option_value = self.conversion_ratio * (
             self.S * norm.cdf(d1) - 
             self.K * np.exp(-self.r*self.T) * norm.cdf(d2)

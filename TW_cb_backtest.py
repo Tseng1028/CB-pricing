@@ -58,7 +58,7 @@ class TaiwanCBStrategy:
             'conversion_price': df['轉換價格'].astype(float),
             'conversion_value': df['轉換價值 (1000)'].astype(float),
             'market_premium': df['CB-市值溢價%'].astype(float),
-            'remaining_years': (pd.to_datetime(df['到期日']) - 
+            'remaining_years': (pd.to_datetime(df['到期日'].astype(str), format='%Y%m%d') - 
                               pd.to_datetime(df['年月'].astype(str), format='%Y%m')).dt.days / 365.0,
             'is_guaranteed': (df['是否擔保(Y/N)'] == 'Y').astype(int)
         })
@@ -144,7 +144,10 @@ class TaiwanCBStrategy:
         - analysis_data: 處理後的分析資料DataFrame
         
         Returns:
-        - DataFrame: 各模型的交易機會和績效指標
+        - tuple: (trading_opportunities, model_prices, trading_signals)
+            - trading_opportunities: 交易機會和績效指標
+            - model_prices: 各模型計算出的理論價格
+            - trading_signals: 整合後的交易訊號DataFrame
         """
         models_evaluation = {}
         
@@ -152,11 +155,11 @@ class TaiwanCBStrategy:
             try:
                 self.pricer = ConvertibleBondPricer(
                     S=row['stock_price'],
-                    K=row['conversion_price'],
+                    K=100,
                     T=row['remaining_years'],
                     r=0.015,  # 固定無風險利率1.5%
-                    sigma=0.3,  # 使用固定波動率30%
-                    conversion_ratio=1.0,
+                    sigma=row['volatility'],  
+                    conversion_ratio=100 / row['conversion_price'],
                     credit_spread=0.02,  # 固定信用利差2%
                     trigger_price=row['conversion_price']*1.3  # 轉換價格130%為強制贖回價
                 )
@@ -169,7 +172,7 @@ class TaiwanCBStrategy:
                         lambda_jump=1.0,
                         mu_jump=-0.1,
                         sigma_jump=0.2,
-                        num_sims=1000  # 減少模擬次數以提高速度
+                        num_sims=1000
                     )
                 }
             except Exception as e:
@@ -183,19 +186,39 @@ class TaiwanCBStrategy:
         
         model_prices = pd.DataFrame(models_evaluation).T
         
+        # 創建一個DataFrame來存儲所有交易訊號
+        trading_signals = pd.DataFrame(index=analysis_data.index)
+        trading_signals['Market_Price'] = analysis_data['cb_price']
+        
         # 計算各模型的套利機會
         trading_opportunities = pd.DataFrame()
         for model in ['BS', 'Binomial', 'MonteCarlo', 'JumpDiffusion']:
+            # 儲存模型價格
+            trading_signals[f'{model}_Price'] = model_prices[model]
+            
             # 計算定價偏差
             mispricing = model_prices[model] - analysis_data['cb_price']
-            # 計算Z分數（標準化偏差）
-            z_score = (mispricing - mispricing.rolling(20).mean()) / mispricing.rolling(20).std()
+            trading_signals[f'{model}_Mispricing'] = mispricing
             
-            # 生成交易信號
+            # 註解掉原本的Z-score計算部分
+            # # 計算Z分數（標準化偏差）
+            # z_score = (mispricing - mispricing.rolling(3).mean()) / mispricing.rolling(3).std()
+            # trading_signals[f'{model}_Z_Score'] = z_score
+            
+            # # 設定較實用的Z分數閾值
+            # z_score_threshold = 1
+            
+            # # 使用Z-score生成交易信號
+            # trading_opportunities[f'{model}_signal'] = np.where(
+            #     z_score > z_score_threshold, -1,
+            #     np.where(z_score < -z_score_threshold, 1, 0))
+
+            # 改用直接價格差異來決定交易訊號
             trading_opportunities[f'{model}_signal'] = np.where(
-                z_score > 1.5, -1,  # 過高則賣出
-                np.where(z_score < -1.5, 1, 0)  # 過低則買入
-            )
+                mispricing > 0, 1,  # 模型價格高於市場價格(低估)時買進
+                np.where(mispricing < 0, -1, 0))  # 模型價格低於市場價格(高估)時賣出
+            
+            trading_signals[f'{model}_Signal'] = trading_opportunities[f'{model}_signal']
             
             # 計算報酬率
             position = trading_opportunities[f'{model}_signal'].shift(1)
@@ -203,17 +226,21 @@ class TaiwanCBStrategy:
             
             trading_opportunities[f'{model}_returns'] = returns
             trading_opportunities[f'{model}_cumulative_returns'] = (1 + returns).cumprod()
-        
-        return trading_opportunities
-    
-    def plot_results(self, analysis_data, trading_opportunities):
+
+        return trading_opportunities, model_prices, trading_signals
+    #先用單純報酬率(最多-1 - 1單位)
+
+    def plot_results(self, analysis_data, model_results):
         """
         Plot analysis results
         
         Parameters:
         - analysis_data: Processed analysis data
-        - trading_opportunities: Trading opportunities and performance metrics
+        - model_results: Tuple of (trading_opportunities, model_prices, trading_signals)
         """
+        # 解包模型結果
+        trading_opportunities, model_prices, trading_signals = model_results
+        
         fig, axes = plt.subplots(3, 1, figsize=(15, 20))
         
         # 1. Price and Implied Volatility
@@ -231,7 +258,7 @@ class TaiwanCBStrategy:
         # 2. Trading Signals
         ax2 = axes[1]
         for model in ['BS', 'Binomial', 'MonteCarlo', 'JumpDiffusion']:
-            signals = trading_opportunities[f'{model}_signal']
+            signals = trading_signals[f'{model}_Signal']  # 使用新的trading_signals DataFrame
             # Mark buy points
             buy_points = signals[signals == 1].index
             # Mark sell points
@@ -249,7 +276,7 @@ class TaiwanCBStrategy:
         # 3. Performance Comparison
         ax3 = axes[2]
         for model in ['BS', 'Binomial', 'MonteCarlo', 'JumpDiffusion']:
-            ax3.plot(trading_opportunities.index, 
+            ax3.plot(trading_signals.index, 
                     trading_opportunities[f'{model}_cumulative_returns'],
                     label=f'{model}')
         ax3.set_title('Cumulative Returns')
@@ -257,3 +284,29 @@ class TaiwanCBStrategy:
         
         plt.tight_layout()
         plt.show()
+
+    def calculate_performance_metrics(self, model_results):
+        """
+        計算各模型的績效指標
+        
+        Parameters:
+        - model_results: 模型計算結果的元組 (trading_opportunities, model_prices, trading_signals)
+        
+        Returns:
+        - DataFrame: 各模型的績效指標
+        """
+        trading_opportunities, _, trading_signals = model_results
+        
+        performance_metrics = {}
+        for model in ['BS', 'Binomial', 'MonteCarlo', 'JumpDiffusion']:
+            returns = trading_opportunities[f'{model}_returns']
+            performance_metrics[model] = {
+                'Sharpe Ratio': np.sqrt(252) * returns.mean() / returns.std() if returns.std() != 0 else 0,
+                'Max Drawdown': (1 - trading_opportunities[f'{model}_cumulative_returns'] / 
+                            trading_opportunities[f'{model}_cumulative_returns'].cummax()).max(),
+                'Win Rate': (returns > 0).mean(),
+                'Avg Return': returns.mean() * 252,  # 年化收益率
+                'Trading Frequency': (trading_signals[f'{model}_Signal'] != 0).mean()
+            }
+        
+        return pd.DataFrame(performance_metrics).round(4)
